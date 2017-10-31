@@ -8,13 +8,9 @@
 #ifndef THREADPOOL_THREADPOOL_H_
 #define THREADPOOL_THREADPOOL_H_
 
-/* TODO: Define that in compilation options */
-#define THREADPOOL_IS_SINGLETON
-
-#ifdef THREADPOOL_IS_SINGLETON
-	#define USE_SINGLETON true
-#else
-	#define USE_SINGLETON false
+/* TODO: Remove this temporary development definition */
+#ifndef THREADPOOL_IS_SINGLETON
+#define THREADPOOL_IS_SINGLETON true
 #endif
 
 #define DEBUG_CONSOLE_OUTPUT true
@@ -30,7 +26,7 @@
 #include <condition_variable>
 
 /* Boost inclusions */
-#if USE_SINGLETON
+#if THREADPOOL_IS_SINGLETON
 	#include <boost/serialization/singleton.hpp>
 #endif
 
@@ -53,7 +49,7 @@
 namespace Core
 {
 	class THREADPOOL_EXPORT ThreadPool
-#if USE_SINGLETON
+#if THREADPOOL_IS_SINGLETON
 		:	public boost::serialization::singleton<ThreadPool>
 #endif
 	{
@@ -62,46 +58,42 @@ namespace Core
 		{
 		private:
 
-			class WorkerState
+			/** @enum mapper::State
+			 *  @brief Thread pool worker status
+			 */
+			enum class State: unsigned int
 			{
-			public:
-				/** @enum mapper::State
-				 *  @brief Thread pool worker status
-				 */
-				enum class State: unsigned int
-				{
-					IDLE,		/**< No task is being executed */
-					RUNNING,	/**< Worker is currently running a task */
-					WAITING,	/**< Worker is waiting */
-					TERMINATED,	/**< Worker is terminated */
-				};
+				IDLE,		/**< No task is being executed */
+				RUNNING,	/**< Worker is currently running a task */
+				WAITING,	/**< Worker is waiting */
+				TERMINATED,	/**< Worker is terminated */
+			};
 
-				WorkerState( void )
-					:	mState( State::IDLE )
-				{}
-
-				void set( State state )
+			void setState( const State state )
+			{
+				/* Request to terminate the worker should not be overwritten by some other state */
+				if( ( this->mState != State::TERMINATED )
+				 && ( this->mState != state ) )
 				{
-					/* Request to terminate the worker should not be overwritten by some other state */
-					if( this->mState != State::TERMINATED ) this->mState = state;
+					this->mState = state;
 
 #if DEBUG_CONSOLE_OUTPUT
 					switch( this->mState )
 					{
-						case State::IDLE : std::cout << "Worker is in IDLE state" << std::endl; break;
-						case State::RUNNING : std::cout << "Worker is in RUNNING state" << std::endl; break;
-						case State::WAITING : std::cout << "Worker is in WAITING state" << std::endl; break;
-						case State::TERMINATED : std::cout << "Worker is in TERMINATED state" << std::endl; break;
+						case State::IDLE : std::cout << "[Worker " << this->getID() << "] -> IDLE" << std::endl; break;
+						case State::RUNNING : std::cout << "[Worker " << this->getID() << "] -> RUNNING" << std::endl; break;
+						case State::WAITING : std::cout << "[Worker " << this->getID() << "] -> WAITING" << std::endl; break;
+						case State::TERMINATED : std::cout << "[Worker " << this->getID() << "] -> TERMINATED" << std::endl; break;
 						default : std::cout << "Worker is in UNKNOWN state" << std::endl; break;
 					}
 #endif /* DEBUG_CONSOLE_OUTPUT */
 				}
+			}
 
-				State get( void ) const { return( this->mState ); }
-
-			private:
-				std::atomic<State> mState;
-			};
+			State getState( void ) const
+			{
+				return( this->mState );
+			}
 
 		public:
 
@@ -111,7 +103,7 @@ namespace Core
 			 * Runs the worker's taskRunner() in the stand alone thread.
 			 */
 			Worker( ThreadPool * threadPool )
-				:	mWorkerState()
+				:	mState( State::IDLE )
 			{
 				/* Run the task runner in new thread */
 				this->mThread = std::thread( std::bind( & Worker::taskRunner, this, threadPool ) );
@@ -125,30 +117,68 @@ namespace Core
 			 */
 			~Worker( void )
 			{
-				/* Force termination if not yet done */
-				if( ( this->mWorkerState ).get() != WorkerState::State::TERMINATED )
-					( this->mWorkerState ).set( WorkerState::State::TERMINATED );
+				this->terminate();
+
+				std::thread::id ID = this->getID();
+
+				std::cout << "[Worker " << ID << "] Joining thread..." << std::endl;
 
 				/* Wait for the thread to finish */
 				if( ( this->mThread ).joinable() ) ( this->mThread ).join();
+
+				std::cout << "[Worker " << ID << "] ...finished" << std::endl;
+
+				return;
 			}
 
-			void terminate( void ) { ( this->mWorkerState ).set( WorkerState::State::TERMINATED ); }
+			/* FIXME: The termination should be requested here only. It might not be possible to terminated the worker all the time.
+			 * For example while the worker is executing the task and it's state is RUNNING, the worker must wait till the task is finished
+			 * and terminate later on. */
+			void terminate( void )
+			{
+				/* If the worker is not executing anything - is not in RUNNING nor in WAITING state - it can be terminated */
+#if false
+				if( this->getState() == State::IDLE )
+#endif
+					this->setState( State::TERMINATED );
+			}
+
+			bool isTerminated( void ) { return( this->mTerminated ); }
 
 			/**
 			 * @brief Task is waiting notification
 			 *
 			 * Notifies the worker the task which is currently executed is waiting for some event.
 			 */
-			void wait( void ) { ( this->mWorkerState ).set( WorkerState::State::WAITING ); }
+			void wait( void ) { this->setState( State::WAITING ); }
+
+			bool isWaiting( void ) { return( this->getState() == State::WAITING ); }
 
 			/**
 			 * @brief Task is running notification
 			 *
 			 * Notifies the worker the task which is currently continuing its execution.
 			 */
-			void run( void ) { ( this->mWorkerState ).set( WorkerState::State::RUNNING ); }
+			void run( void ) { this->setState( State::RUNNING ); }
 
+			bool isRunning( void ) { return( this->getState() == State::RUNNING ); }
+
+			/**
+			 * @brief Worker is ready
+			 *
+			 * If the worker is either in IDLE or RUNNING state, it is considered active
+			 */
+			bool isActive( void )
+			{
+				return( ( this->getState() == State::IDLE )
+				     || ( this->getState() == State::RUNNING ) );
+			}
+
+			/**
+			 * @brief Worker thread ID
+			 *
+			 * Returns the thread::id of the thread in which worker is executing it's tasks
+			 */
 			std::thread::id getID( void ) const
 			{
 				return( ( this->mThread ).get_id() );
@@ -160,7 +190,7 @@ namespace Core
 			 * @brief Worker task runner
 			 *
 			 * This method is the hearth of the worker. Internally it is an infinite loop able to be terminated
-			 * by appropriate worker state (WorkerState::State::TERMINATED). Until not terminated, it continuously
+			 * by appropriate worker state (State::TERMINATED). Until not terminated, it continuously
 			 * checks the task queue for tasks to be executed. If there are any, it fetches the task out of the queue
 			 * and executes it.
 			 * Once there are no tasks waiting in the queue, it goes into idle mode and waits there until new tasks
@@ -169,55 +199,80 @@ namespace Core
 			void taskRunner( ThreadPool * threadPool )
 			{
 				/* Infinite loop */
-				while( ( this->mWorkerState ).get() != WorkerState::State::TERMINATED )
+				while( this->getState() != State::TERMINATED )
 				{
 					/* Lock the task queue to get thread safe access */
-					std::unique_lock<std::mutex> taskQueueLock { threadPool->getTaskQueueMutex() };
+					std::unique_lock<std::mutex> taskQueueLock( threadPool->getTaskQueueMutex() );
 
 					/* Check the amount of tasks waiting in the queue. If there aren't any, go to IDLE state
 					 * and wait there till some tasks are available or the worker is terminated */
 					if( threadPool->getNumOfTasksWaiting() == 0 )
 					{
-						(this->mWorkerState).set( WorkerState::State::IDLE );
+						this->setState( State::IDLE );
 
 						/* Wait for tasks to be available in the queue.
 						 *
-						 * The worker is blocked until the condition variable is notified by notify_one() or notify_all()
+						 * Atomically releases lock, blocks the current executing thread. When unblocked, regardless of the reason,
+						 * lock is reacquired and wait exits. The worker is blocked until the condition variable is notified by
+						 * notify_one() or notify_all()
 						 * OR
 						 * the worker should be terminated.
 						 */
 						threadPool->mTasksAvailable.wait( taskQueueLock, [&]()
 						{
-							return( ( this->mWorkerState ).get() == WorkerState::State::TERMINATED );
+							/* Predicate which returns ​false if the waiting should be continued */
+							return( this->getState() == State::TERMINATED );
+
 						} );
+
+						/* Unlock the task queue */
+						taskQueueLock.unlock();
+
+						/* Once the waiting for the task or termination comes, break the iteration.
+						 * If the termination is requested, the infinite loop is exited and the thread gets finalized. */
+						break;
 					}
+					/* If there are some tasks to execute and the worker is not terminated, fetch the task and execute it */
+					else
+					{
+						/* It is about to execute the task so the worker is running again */
+						this->setState( State::RUNNING );
 
-					/* Check for termination request again as it might be set during waiting for new tasks to come... */
-					if( ( this->mWorkerState ).get() == WorkerState::State::TERMINATED ) break;
+						/* Fetch the task from task queue */
+						TTask task = ( threadPool->mTaskQueue ).front();
 
-					/* It is about to execute the task so the worker is running again */
-					( this->mWorkerState ).set( WorkerState::State::RUNNING );
+						/* Remove fetched task */
+						( threadPool->mTaskQueue ).pop();
 
-					/* Fetch next task to be executed */
-					TTask task = std::move( threadPool->fetchTask() );
+						/* Unlock the task queue */
+						taskQueueLock.unlock();
 
-					/* Unlock the task queue */
-					taskQueueLock.unlock();
+						/* Execute the task.
+						 *
+						 * From within the task, the worker might be notified the task is waiting for some event using
+						 * wait() and run() methods - handled via the ThreadPool instance. So the worker state might be
+						 * switched between State::RUNNING and State::WAITING */
+						task();
 
-					/* Execute the task
-					 * From within the task, the worker might be notified the task is waiting for some event using
-					 * wait() and run() methods - handled via the ThreadPool instance. So the worker state might be
-					 * switched between WorkerState::State::RUNNING and WorkerState::State::WAITING */
-					task();
+						/* Once the task is finished, switch the worker to IDLE state */
+						this->setState( State::IDLE );
+					}
 				}
+
+				std::cout << "[Worker " << this->getID() << "] Task runner exits. Thread is finished." << std::endl;
+
+				/* Set the flag the worker has been terminated */
+				this->mTerminated = true;
 			}
 
-			WorkerState	mWorkerState;
+			State		mState;
 
 			std::thread	mThread;
+
+			bool 		mTerminated = false;
 		};
 
-#if USE_SINGLETON
+#if THREADPOOL_IS_SINGLETON
 	protected:
 #else
 	public:
@@ -229,19 +284,26 @@ namespace Core
 		 */
 		ThreadPool( void )
 		{
-			for( unsigned int i = 0; i < ( std::thread::hardware_concurrency() - 1 ); i++ )
-			{
-				( this->mWorkers ).emplace( ( this->mWorkers ).end(), std::make_shared<Worker>( this ) );
-			}
+			this->trimWorkers( 4 );
 		}
 
 		~ThreadPool( void )
 		{
-			/* First of all, all workers must be stopped */
+			std::cout << "Going to terminate all workers..." << std::endl;
+
+			/* First of all, terminate all workers */
 			for( auto & worker : this->mWorkers )
 			{
 				worker->terminate();
 			}
+
+			/* Notify all workers that it's time to recover from possible IDLE state
+			 * and to do the termination */
+			this->mTasksAvailable.notify_all();
+
+			this->trimWorkers( 0 );
+
+			std::cout << "Trimmed." << std::endl;
 		}
 
 	public:
@@ -268,23 +330,22 @@ namespace Core
 			/* Make unique packaged task instance */
 			std::shared_ptr<TPackagedTask> tTask = std::make_shared<TPackagedTask>( std::bind( std::forward<FUNCTION>( function ), std::forward<ARGUMENTS>( arguments )... ) );
 
-			// get the future to return later
-			std::future<typename std::result_of<FUNCTION( ARGUMENTS... )>::type> ReturnFuture = tTask->get_future();
+			/* Get the future to return later */
+			std::future<typename std::result_of<FUNCTION( ARGUMENTS... )>::type> returnFuture = tTask->get_future();
 
-			/* Thread-safe task queue access block */
-			{
-				/* Lock task queue */
-				std::lock_guard<std::mutex> lock( this->getTaskQueueMutex() );
+			/* Lock the task queue */
+			std::unique_lock<std::mutex> taskQueueLock( this->getTaskQueueMutex() );
 
-				this->mTaskQueue.emplace( [tTask]() { (* tTask)(); } );
+			/* Emplace the task into the task queue */
+			this->mTaskQueue.emplace( [tTask]() { (* tTask)(); } );
 
-				/* The lock guard expires here so the task queue gets unlocked */
-			}
+			/* Unlock the task queue */
+			taskQueueLock.unlock();
 
-			// let a waiting thread know there is an available job
+			/* Let waiting workers know there is an available job */
 			this->mTasksAvailable.notify_one();
 
-			return ReturnFuture;
+			return returnFuture;
 		}
 
 		/**
@@ -323,6 +384,106 @@ namespace Core
 
 	protected:
 
+		void trimWorkers( const unsigned int size = ( std::thread::hardware_concurrency() - 1 ) )
+		{
+			unsigned int nActiveWorkers = 0;
+
+			/* Iterate throuhg all the workers */
+			for( const auto & worker : this->mWorkers )
+			{
+				/* Once the worker is terminated... */
+				if( !worker->isTerminated() )
+				{
+					nActiveWorkers++;
+				}
+			}
+
+#if DEBUG_CONSOLE_OUTPUT
+			std::cout << "TRIM: Threre are " << nActiveWorkers << " active workers. The target is to have " << size << std::endl;
+#endif
+
+			/* There are less active workers than recommended -> add some */
+			if( nActiveWorkers < size )
+			{
+				for( unsigned int i = 0; i < ( size - nActiveWorkers ); i++ )
+				{
+#if DEBUG_CONSOLE_OUTPUT
+					std::cout << "TRIM: Creating worker" << std::endl;
+#endif
+					( this->mWorkers ).emplace( ( this->mWorkers ).end(), std::make_shared<Worker>( this ) );
+				}
+			}
+
+			/* Remove all terminated workers */
+			for( const auto & worker : this->mWorkers )
+			{
+				/* Once the worker is terminated... */
+				if( worker->isTerminated() )
+				{
+#if DEBUG_CONSOLE_OUTPUT
+					std::cout << "TRIM: Removing terminated worker." << std::endl;
+#endif
+					( this->mWorkers ).remove( worker );
+				}
+			}
+
+#if DEBUG_CONSOLE_OUTPUT
+			std::cout << "TRIM: At the end of trim there is(are) currently " << ( this->mWorkers ).size() << " worker(s)." << std::endl;
+#endif
+
+#if false
+#if DEBUG_CONSOLE_OUTPUT
+			std::cout << "Removing all terminated workers..." << std::endl;
+#endif
+
+			/* Iterate through all the workers and remove all terminated ones */
+			for( const auto & worker : this->mWorkers )
+			{
+				/* Once the worker is terminated, remove it */
+				if( worker->isTerminated() ) ( this->mWorkers ).remove( worker );
+			}
+
+			/* The amount of active workers should match the HW defined constraint */
+			unsigned short nActiveWorkers = ( this->mWorkers ).size();
+
+#if DEBUG_CONSOLE_OUTPUT
+			std::cout << "Adding " << ( size - nActiveWorkers ) << " workers." << std::endl;
+#endif
+
+			/* There are less active workers than recommended -> add some */
+			if( nActiveWorkers < size )
+			{
+				for( unsigned int i = 0; i < ( size - nActiveWorkers ); i++ )
+				{
+					( this->mWorkers ).emplace( ( this->mWorkers ).end(), std::make_shared<Worker>( this ) );
+				}
+			}
+
+#if false
+			/* There are more active workers than recommended -> remove any */
+			if( nActiveWorkers > size )
+			{
+				unsigned int nWorkersToTerminate = ( this->mWorkers ).size() - size;
+
+				/* Iterate through all the workers... */
+				for( const auto & worker : this->mWorkers )
+				{
+					/* Terminate one worker */
+					worker->terminate();
+
+					this->mTasksAvailable.notify_all();
+
+					/* Decrease the amount of workers to be terminated */
+					nWorkersToTerminate--;
+
+					/* If there are no more workers to be terminated, break the loop */
+					if( nWorkersToTerminate == 0 ) break;
+				}
+			}
+#endif
+#endif
+		}
+
 		/**
 		 * @brief Get current worker being used
 		 *
@@ -359,26 +520,6 @@ namespace Core
 		using TTask = std::function<void( void )>;
 
 		/**
-		 * @brief Fetch the task from task queue
-		 *
-		 * Fetches and removes the task from the task queue and returns it for further processing.
-		 */
-		TTask fetchTask( void )
-		{
-			TTask task;
-
-			/* Check whether the task queue is empty. */
-			if( !( this->mTaskQueue ).empty() )
-			{
-				task = ( this->mTaskQueue ).front();
-
-				( this->mTaskQueue ).pop();
-			}
-
-			return( std::move( task ) );
-		}
-
-		/**
 		 * @brief Get task queue mutex
 		 *
 		 * Returns a reference to mutex securing the task queue in terms of concurrent access.
@@ -390,6 +531,8 @@ namespace Core
 
 	private:
 
+		/* TODO: Rework a little -> not to operate with the mutex but with std::unique_lock<std::mutex> ?
+		 * Inspiration: https://stackoverflow.com/a/21900725/5677080 */
 		mutable std::mutex					mTaskQueueMutex;
 
 		std::queue<TTask>					mTaskQueue;
@@ -403,7 +546,9 @@ namespace Core
 		 * std::list is a container that supports constant time insertion and removal of elements
 		 * from anywhere in the container. This feature is used in adding/removal of new workers.
 		 */
-		std::list<std::shared_ptr<Worker>>	mWorkers;
+		using TWorkersContainer = std::list<std::shared_ptr<Worker>>;
+
+		TWorkersContainer	mWorkers;
 	};
 }
 #endif /* THREADPOOL_THREADPOOL_H_ */
