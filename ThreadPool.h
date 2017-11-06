@@ -63,19 +63,29 @@ namespace Core
 			 */
 			enum class State: unsigned int
 			{
-				IDLE,		/**< No task is being executed */
-				RUNNING,	/**< Worker is currently running a task */
-				WAITING,	/**< Worker is waiting */
-				TERMINATED,	/**< Worker is terminated */
+				IDLE,			/**< No task is being executed */
+				RUNNING,		/**< Worker is currently running a task */
+				WAITING,		/**< Worker is waiting */
+				TERMINATING,	/**< Worker is about to be terminated */
+				SHUTDOWN,		/**< Worker is shut down */
 			};
 
 			void setState( const State state )
 			{
+				if( ( ( this->mState == State::TERMINATING ) && ( state == State::SHUTDOWN ) )
+					|| ( ( state < State::TERMINATING ) && ( this->mState != state  ) )
+					|| ( ( state == State::TERMINATING ) && ( this->mState != State::SHUTDOWN ) )
+				  )
+				{
+					this->mState = state;
+#if false
+				}
 				/* Request to terminate the worker should not be overwritten by some other state */
-				if( ( this->mState != State::TERMINATED )
+				if( ( ( this->mState != State::TERMINATING ) || ( this->mState != State::SHUTDOWN ) )
 				 && ( this->mState != state ) )
 				{
 					this->mState = state;
+#endif
 
 #if DEBUG_CONSOLE_OUTPUT
 					switch( this->mState )
@@ -83,7 +93,8 @@ namespace Core
 						case State::IDLE : std::cout << "[Worker " << this->getID() << "] -> IDLE" << std::endl; break;
 						case State::RUNNING : std::cout << "[Worker " << this->getID() << "] -> RUNNING" << std::endl; break;
 						case State::WAITING : std::cout << "[Worker " << this->getID() << "] -> WAITING" << std::endl; break;
-						case State::TERMINATED : std::cout << "[Worker " << this->getID() << "] -> TERMINATED" << std::endl; break;
+						case State::TERMINATING : std::cout << "[Worker " << this->getID() << "] -> TERMINATING" << std::endl; break;
+						case State::SHUTDOWN : std::cout << "[Worker " << this->getID() << "] -> SHUTDOWN" << std::endl; break;
 						default : std::cout << "Worker is in UNKNOWN state" << std::endl; break;
 					}
 #endif /* DEBUG_CONSOLE_OUTPUT */
@@ -137,13 +148,12 @@ namespace Core
 			void terminate( void )
 			{
 				/* If the worker is not executing anything - is not in RUNNING nor in WAITING state - it can be terminated */
-#if false
-				if( this->getState() == State::IDLE )
-#endif
-					this->setState( State::TERMINATED );
+				this->setState( State::TERMINATING );
 			}
 
-			bool isTerminated( void ) { return( this->mTerminated ); }
+			bool isTerminating( void ) { return( this->getState() == State::TERMINATING ); }
+
+			bool isShutDown( void ) { return( this->getState() == State::SHUTDOWN ); }
 
 			/**
 			 * @brief Task is waiting notification
@@ -199,7 +209,7 @@ namespace Core
 			void taskRunner( ThreadPool * threadPool )
 			{
 				/* Infinite loop */
-				while( this->getState() != State::TERMINATED )
+				while( this->getState() != State::TERMINATING )
 				{
 					/* Lock the task queue to get thread safe access */
 					std::unique_lock<std::mutex> taskQueueLock( threadPool->getTaskQueueMutex() );
@@ -221,7 +231,7 @@ namespace Core
 						threadPool->mTasksAvailable.wait( taskQueueLock, [&]()
 						{
 							/* Predicate which returns ​false if the waiting should be continued */
-							return( this->getState() == State::TERMINATED );
+							return( this->getState() == State::TERMINATING );
 
 						} );
 
@@ -261,8 +271,8 @@ namespace Core
 
 				std::cout << "[Worker " << this->getID() << "] Task runner exits. Thread is finished." << std::endl;
 
-				/* Set the flag the worker has been terminated */
-				this->mTerminated = true;
+				/* The worker is shut down */
+				this->setState( State::SHUTDOWN );
 			}
 
 			State		mState;
@@ -283,8 +293,12 @@ namespace Core
 		 * This constructor must be made protected in case of ThreadPool being a singleton.
 		 */
 		ThreadPool( void )
+			:	mSize( std::thread::hardware_concurrency() - 1 ),
+				/* TODO */
+				mShutdown( false )
 		{
-			this->trimWorkers( 4 );
+			/* Run the task runner in new thread */
+			this->mTrimmingThread = std::thread( std::bind( & ThreadPool::trim, this, this ) );
 		}
 
 		~ThreadPool( void )
@@ -301,9 +315,23 @@ namespace Core
 			 * and to do the termination */
 			this->mTasksAvailable.notify_all();
 
-			this->trimWorkers( 0 );
+			/* No (zero) workers are needed. */
+			this->mSize = 0;
 
-			std::cout << "Trimmed." << std::endl;
+			/* Do the trimming */
+			this->mPerformTrimming.notify_one();
+
+			std::cout << "Going to join trimming thread." << std::endl;
+
+			this->mShutdown = true;
+			this->mPerformTrimming.notify_one();
+
+			/* Join trimming thread */
+			( this->mTrimmingThread ).join();
+
+			std::cout << "Joined." << std::endl;
+
+			std::cout << "ThreadPool destructor done." << std::endl;
 		}
 
 	public:
@@ -384,106 +412,6 @@ namespace Core
 
 	protected:
 
-		void trimWorkers( const unsigned int size = ( std::thread::hardware_concurrency() - 1 ) )
-		{
-			unsigned int nActiveWorkers = 0;
-
-			/* Iterate throuhg all the workers */
-			for( const auto & worker : this->mWorkers )
-			{
-				/* Once the worker is terminated... */
-				if( !worker->isTerminated() )
-				{
-					nActiveWorkers++;
-				}
-			}
-
-#if DEBUG_CONSOLE_OUTPUT
-			std::cout << "TRIM: Threre are " << nActiveWorkers << " active workers. The target is to have " << size << std::endl;
-#endif
-
-			/* There are less active workers than recommended -> add some */
-			if( nActiveWorkers < size )
-			{
-				for( unsigned int i = 0; i < ( size - nActiveWorkers ); i++ )
-				{
-#if DEBUG_CONSOLE_OUTPUT
-					std::cout << "TRIM: Creating worker" << std::endl;
-#endif
-					( this->mWorkers ).emplace( ( this->mWorkers ).end(), std::make_shared<Worker>( this ) );
-				}
-			}
-
-			/* Remove all terminated workers */
-			for( const auto & worker : this->mWorkers )
-			{
-				/* Once the worker is terminated... */
-				if( worker->isTerminated() )
-				{
-#if DEBUG_CONSOLE_OUTPUT
-					std::cout << "TRIM: Removing terminated worker." << std::endl;
-#endif
-					( this->mWorkers ).remove( worker );
-				}
-			}
-
-#if DEBUG_CONSOLE_OUTPUT
-			std::cout << "TRIM: At the end of trim there is(are) currently " << ( this->mWorkers ).size() << " worker(s)." << std::endl;
-#endif
-
-#if false
-#if DEBUG_CONSOLE_OUTPUT
-			std::cout << "Removing all terminated workers..." << std::endl;
-#endif
-
-			/* Iterate through all the workers and remove all terminated ones */
-			for( const auto & worker : this->mWorkers )
-			{
-				/* Once the worker is terminated, remove it */
-				if( worker->isTerminated() ) ( this->mWorkers ).remove( worker );
-			}
-
-			/* The amount of active workers should match the HW defined constraint */
-			unsigned short nActiveWorkers = ( this->mWorkers ).size();
-
-#if DEBUG_CONSOLE_OUTPUT
-			std::cout << "Adding " << ( size - nActiveWorkers ) << " workers." << std::endl;
-#endif
-
-			/* There are less active workers than recommended -> add some */
-			if( nActiveWorkers < size )
-			{
-				for( unsigned int i = 0; i < ( size - nActiveWorkers ); i++ )
-				{
-					( this->mWorkers ).emplace( ( this->mWorkers ).end(), std::make_shared<Worker>( this ) );
-				}
-			}
-
-#if false
-			/* There are more active workers than recommended -> remove any */
-			if( nActiveWorkers > size )
-			{
-				unsigned int nWorkersToTerminate = ( this->mWorkers ).size() - size;
-
-				/* Iterate through all the workers... */
-				for( const auto & worker : this->mWorkers )
-				{
-					/* Terminate one worker */
-					worker->terminate();
-
-					this->mTasksAvailable.notify_all();
-
-					/* Decrease the amount of workers to be terminated */
-					nWorkersToTerminate--;
-
-					/* If there are no more workers to be terminated, break the loop */
-					if( nWorkersToTerminate == 0 ) break;
-				}
-			}
-#endif
-#endif
-		}
-
 		/**
 		 * @brief Get current worker being used
 		 *
@@ -529,15 +457,81 @@ namespace Core
 			return( this->mTaskQueueMutex );
 		}
 
+		/**
+		 * @brief Get workers list mutex
+		 *
+		 * Returns a reference to mutex securing the list of workers in terms of concurrent access.
+		 */
+		std::mutex & getWorkersMutex( void ) const
+		{
+			return( this->mWorkersMutex );
+		}
+
+		void trim( ThreadPool * threadPool )
+		{
+			std::cout << "Starting trimming thread" << std::endl;
+
+			while( !( this->mShutdown ) )
+			{
+				/* Lock the task queue to get thread safe access */
+				std::unique_lock<std::mutex> workersListLock( threadPool->getWorkersMutex() );
+
+				unsigned int nActiveWorkers = 0;
+
+				for( const auto & worker : this->mWorkers )
+				{
+					if( worker->isActive() ) nActiveWorkers++;
+				}
+
+				/* There are less active workers than recommended -> add some */
+				if( nActiveWorkers < threadPool->mSize )
+				{
+					for( unsigned int i = 0; i < ( threadPool->mSize - nActiveWorkers ); i++ )
+					{
+						( this->mWorkers ).emplace( ( this->mWorkers ).end(), std::make_shared<Worker>( this ) );
+					}
+				}
+
+				/* Remove all terminated workers */
+				for( const auto & worker : this->mWorkers )
+				{
+					/* If worker is currently shutting down itself */
+					if( worker->isTerminating() )
+					{
+						/* Block the thread till the worker is really shut down */
+						while( !worker->isShutDown() );
+
+						std::cout << "Trim removes worker... " << worker << std::endl;
+						/* Remove the worker completely */
+						( this->mWorkers ).remove( worker );
+
+						std::cout << "Done." << worker << std::endl;
+					}
+				}
+
+				std::cout << "Trimming waits." << std::endl;
+
+				/* Wait here till the condition variable is notified */
+				threadPool->mPerformTrimming.wait( workersListLock );
+
+				std::cout << "Trimming continues." << std::endl;
+
+				workersListLock.unlock();
+			}
+
+			std::cout << "Trimming exits." << std::endl;
+		}
+
 	private:
 
 		/* TODO: Rework a little -> not to operate with the mutex but with std::unique_lock<std::mutex> ?
 		 * Inspiration: https://stackoverflow.com/a/21900725/5677080 */
-		mutable std::mutex					mTaskQueueMutex;
+		mutable std::mutex			mTaskQueueMutex;
 
-		std::queue<TTask>					mTaskQueue;
+		std::queue<TTask>			mTaskQueue;
 
-		std::condition_variable				mTasksAvailable;
+		/* TODO: Rename the condition variable as the name does not reflect the real usage */
+		std::condition_variable		mTasksAvailable;
 
 		/**
 		 * @brief Workers
@@ -548,7 +542,17 @@ namespace Core
 		 */
 		using TWorkersContainer = std::list<std::shared_ptr<Worker>>;
 
-		TWorkersContainer	mWorkers;
+		mutable std::mutex			mWorkersMutex;
+
+		TWorkersContainer			mWorkers;
+
+		std::thread					mTrimmingThread;
+
+		std::condition_variable		mPerformTrimming;
+
+		std::atomic<unsigned int> 	mSize;
+
+		std::atomic<bool>			mShutdown;
 	};
 }
 #endif /* THREADPOOL_THREADPOOL_H_ */
