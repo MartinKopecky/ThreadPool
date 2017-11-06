@@ -70,34 +70,59 @@ namespace Core
 				SHUTDOWN,		/**< Worker is shut down */
 			};
 
+#if DEBUG_CONSOLE_OUTPUT
+			std::string showState( const State state )
+			{
+				switch( state )
+				{
+					case State::IDLE : return( "IDLE" ); break;
+					case State::RUNNING : return( "RUNNING" ); break;
+					case State::WAITING : return( "WAITING" ); break;
+					case State::TERMINATING : return( "TERMINATING" ); break;
+					case State::SHUTDOWN : return( "SHUTDOWN" ); break;
+					default : return( "UNKNOWN" ); break;
+				}
+			}
+#endif /* DEBUG_CONSOLE_OUTPUT */
+
 			void setState( const State state )
 			{
-				if( ( ( this->mState == State::TERMINATING ) && ( state == State::SHUTDOWN ) )
-					|| ( ( state < State::TERMINATING ) && ( this->mState != state  ) )
-					|| ( ( state == State::TERMINATING ) && ( this->mState != State::SHUTDOWN ) )
-				  )
-				{
-					this->mState = state;
 #if false
-				}
-				/* Request to terminate the worker should not be overwritten by some other state */
-				if( ( ( this->mState != State::TERMINATING ) || ( this->mState != State::SHUTDOWN ) )
-				 && ( this->mState != state ) )
+				if( state != this->mState )
 				{
-					this->mState = state;
+#if DEBUG_CONSOLE_OUTPUT
+					std::cout << "[Worker " << this->getID() << "] " << this->showState( this->mState ) << "->" << this->showState( state ) << std::endl;
+#endif /* DEBUG_CONSOLE_OUTPUT */
+
+					switch( state )
+					{
+					/* New state TERMINATING is requested */
+					case State::TERMINATING :
+						if( this->mState != State::SHUTDOWN ) this->mState = state;
+						break;
+
+					/* New state SHUTDOWN is requested */
+					case State::SHUTDOWN :
+						if( this->mState == State::TERMINATING ) this->mState = state;
+						break;
+
+					default: this->mState = state;
+						break;
+					}
+				}
 #endif
 
+				if( ( ( this->mState == State::TERMINATING ) && ( state == State::SHUTDOWN ) )
+					|| ( ( this->mState != State::SHUTDOWN ) && ( state == State::TERMINATING ) )
+					|| ( ( state < State::TERMINATING ) && ( this->mState != state  ) )
+
+				  )
+				{
 #if DEBUG_CONSOLE_OUTPUT
-					switch( this->mState )
-					{
-						case State::IDLE : std::cout << "[Worker " << this->getID() << "] -> IDLE" << std::endl; break;
-						case State::RUNNING : std::cout << "[Worker " << this->getID() << "] -> RUNNING" << std::endl; break;
-						case State::WAITING : std::cout << "[Worker " << this->getID() << "] -> WAITING" << std::endl; break;
-						case State::TERMINATING : std::cout << "[Worker " << this->getID() << "] -> TERMINATING" << std::endl; break;
-						case State::SHUTDOWN : std::cout << "[Worker " << this->getID() << "] -> SHUTDOWN" << std::endl; break;
-						default : std::cout << "Worker is in UNKNOWN state" << std::endl; break;
-					}
+					std::cout << "[Worker " << this->getID() << "] " << this->showState( this->mState ) << "->" << this->showState( state ) << std::endl;
 #endif /* DEBUG_CONSOLE_OUTPUT */
+
+					this->mState = state;
 				}
 			}
 
@@ -132,12 +157,10 @@ namespace Core
 
 				std::thread::id ID = this->getID();
 
-				std::cout << "[Worker " << ID << "] Joining thread..." << std::endl;
-
 				/* Wait for the thread to finish */
 				if( ( this->mThread ).joinable() ) ( this->mThread ).join();
 
-				std::cout << "[Worker " << ID << "] ...finished" << std::endl;
+				std::cout << "[Worker " << ID << "] Thread joined. Worker is destructed." << std::endl;
 
 				return;
 			}
@@ -212,7 +235,7 @@ namespace Core
 				while( this->getState() != State::TERMINATING )
 				{
 					/* Lock the task queue to get thread safe access */
-					std::unique_lock<std::mutex> taskQueueLock( threadPool->getTaskQueueMutex() );
+					std::unique_lock<std::mutex> taskQueueLock( threadPool->mTaskQueueMutex );
 
 					/* Check the amount of tasks waiting in the queue. If there aren't any, go to IDLE state
 					 * and wait there till some tasks are available or the worker is terminated */
@@ -268,8 +291,6 @@ namespace Core
 						this->setState( State::IDLE );
 					}
 				}
-
-				std::cout << "[Worker " << this->getID() << "] Task runner exits. Thread is finished." << std::endl;
 
 				/* The worker is shut down */
 				this->setState( State::SHUTDOWN );
@@ -362,7 +383,7 @@ namespace Core
 			std::future<typename std::result_of<FUNCTION( ARGUMENTS... )>::type> returnFuture = tTask->get_future();
 
 			/* Lock the task queue */
-			std::unique_lock<std::mutex> taskQueueLock( this->getTaskQueueMutex() );
+			std::unique_lock<std::mutex> taskQueueLock( this->mTaskQueueMutex );
 
 			/* Emplace the task into the task queue */
 			this->mTaskQueue.emplace( [tTask]() { (* tTask)(); } );
@@ -386,12 +407,18 @@ namespace Core
 		 */
 		void wait( void )
 		{
+			/* Lock the workers container to get thread safe access */
+			std::unique_lock<std::mutex> workersListLock( this->mWorkersMutex );
+
 			/* Check wheter there is matching worker and is still valid */
 			if( !( this->getWorker() ).expired() )
 			{
 				/* Call worker wait() method */
 				( ( this->getWorker() ).lock() )->wait();
 			}
+
+			/* Unlock the workers container */
+			workersListLock.unlock();
 		}
 
 		/**
@@ -402,12 +429,18 @@ namespace Core
 		 */
 		void run( void )
 		{
+			/* Lock the workers container to get thread safe access */
+			std::unique_lock<std::mutex> workersListLock( this->mWorkersMutex );
+
 			/* Check wheter there is matching worker and is still valid */
 			if( !( this->getWorker() ).expired() )
 			{
 				/* Call worker run() method */
 				( ( this->getWorker() ).lock() )->run();
 			}
+
+			/* Unlock the workers container */
+			workersListLock.unlock();
 		}
 
 	protected:
@@ -447,26 +480,6 @@ namespace Core
 		 */
 		using TTask = std::function<void( void )>;
 
-		/**
-		 * @brief Get task queue mutex
-		 *
-		 * Returns a reference to mutex securing the task queue in terms of concurrent access.
-		 */
-		std::mutex & getTaskQueueMutex( void ) const
-		{
-			return( this->mTaskQueueMutex );
-		}
-
-		/**
-		 * @brief Get workers list mutex
-		 *
-		 * Returns a reference to mutex securing the list of workers in terms of concurrent access.
-		 */
-		std::mutex & getWorkersMutex( void ) const
-		{
-			return( this->mWorkersMutex );
-		}
-
 		void trim( ThreadPool * threadPool )
 		{
 			std::cout << "Starting trimming thread" << std::endl;
@@ -474,7 +487,7 @@ namespace Core
 			while( !( this->mShutdown ) )
 			{
 				/* Lock the task queue to get thread safe access */
-				std::unique_lock<std::mutex> workersListLock( threadPool->getWorkersMutex() );
+				std::unique_lock<std::mutex> workersListLock( threadPool->mWorkersMutex );
 
 				unsigned int nActiveWorkers = 0;
 
@@ -509,17 +522,11 @@ namespace Core
 					}
 				}
 
-				std::cout << "Trimming waits." << std::endl;
-
 				/* Wait here till the condition variable is notified */
 				threadPool->mPerformTrimming.wait( workersListLock );
 
-				std::cout << "Trimming continues." << std::endl;
-
 				workersListLock.unlock();
 			}
-
-			std::cout << "Trimming exits." << std::endl;
 		}
 
 	private:
