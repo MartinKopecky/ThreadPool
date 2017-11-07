@@ -54,92 +54,14 @@ namespace Core
 #endif
 	{
 	protected:
+
 		class Worker
 		{
-		private:
-
-			/** @enum mapper::State
-			 *  @brief Thread pool worker status
-			 */
-			enum class State: unsigned int
-			{
-				IDLE,			/**< No task is being executed */
-				RUNNING,		/**< Worker is currently running a task */
-				WAITING,		/**< Worker is waiting */
-				TERMINATING,	/**< Worker is about to be terminated */
-				SHUTDOWN,		/**< Worker is shut down */
-			};
-
-#if DEBUG_CONSOLE_OUTPUT
-			std::string showState( const State state )
-			{
-				switch( state )
-				{
-					case State::IDLE : return( "IDLE" ); break;
-					case State::RUNNING : return( "RUNNING" ); break;
-					case State::WAITING : return( "WAITING" ); break;
-					case State::TERMINATING : return( "TERMINATING" ); break;
-					case State::SHUTDOWN : return( "SHUTDOWN" ); break;
-					default : return( "UNKNOWN" ); break;
-				}
-			}
-#endif /* DEBUG_CONSOLE_OUTPUT */
-
-			void setState( const State state )
-			{
-#if false
-				if( state != this->mState )
-				{
-#if DEBUG_CONSOLE_OUTPUT
-					std::cout << "[Worker " << this->getID() << "] " << this->showState( this->mState ) << "->" << this->showState( state ) << std::endl;
-#endif /* DEBUG_CONSOLE_OUTPUT */
-
-					switch( state )
-					{
-					/* New state TERMINATING is requested */
-					case State::TERMINATING :
-						if( this->mState != State::SHUTDOWN ) this->mState = state;
-						break;
-
-					/* New state SHUTDOWN is requested */
-					case State::SHUTDOWN :
-						if( this->mState == State::TERMINATING ) this->mState = state;
-						break;
-
-					default: this->mState = state;
-						break;
-					}
-				}
-#endif
-
-				if( ( ( this->mState == State::TERMINATING ) && ( state == State::SHUTDOWN ) )
-					|| ( ( this->mState != State::SHUTDOWN ) && ( state == State::TERMINATING ) )
-					|| ( ( state < State::TERMINATING ) && ( this->mState != state  ) )
-
-				  )
-				{
-#if DEBUG_CONSOLE_OUTPUT
-					std::cout << "[Worker " << this->getID() << "] " << this->showState( this->mState ) << "->" << this->showState( state ) << std::endl;
-#endif /* DEBUG_CONSOLE_OUTPUT */
-
-					this->mState = state;
-				}
-			}
-
-			State getState( void ) const
-			{
-				return( this->mState );
-			}
-
 		public:
 
-			/**
-			 * @brief Thread pool worker constructor
-			 *
-			 * Runs the worker's taskRunner() in the stand alone thread.
-			 */
 			Worker( ThreadPool * threadPool )
-				:	mState( State::IDLE )
+				:	/* Initially the worker state is idle */
+					mState( new Idle )
 			{
 				/* Run the task runner in new thread */
 				this->mThread = std::thread( std::bind( & Worker::taskRunner, this, threadPool ) );
@@ -165,48 +87,6 @@ namespace Core
 				return;
 			}
 
-			/* FIXME: The termination should be requested here only. It might not be possible to terminated the worker all the time.
-			 * For example while the worker is executing the task and it's state is RUNNING, the worker must wait till the task is finished
-			 * and terminate later on. */
-			void terminate( void )
-			{
-				/* If the worker is not executing anything - is not in RUNNING nor in WAITING state - it can be terminated */
-				this->setState( State::TERMINATING );
-			}
-
-			bool isTerminating( void ) { return( this->getState() == State::TERMINATING ); }
-
-			bool isShutDown( void ) { return( this->getState() == State::SHUTDOWN ); }
-
-			/**
-			 * @brief Task is waiting notification
-			 *
-			 * Notifies the worker the task which is currently executed is waiting for some event.
-			 */
-			void wait( void ) { this->setState( State::WAITING ); }
-
-			bool isWaiting( void ) { return( this->getState() == State::WAITING ); }
-
-			/**
-			 * @brief Task is running notification
-			 *
-			 * Notifies the worker the task which is currently continuing its execution.
-			 */
-			void run( void ) { this->setState( State::RUNNING ); }
-
-			bool isRunning( void ) { return( this->getState() == State::RUNNING ); }
-
-			/**
-			 * @brief Worker is ready
-			 *
-			 * If the worker is either in IDLE or RUNNING state, it is considered active
-			 */
-			bool isActive( void )
-			{
-				return( ( this->getState() == State::IDLE )
-				     || ( this->getState() == State::RUNNING ) );
-			}
-
 			/**
 			 * @brief Worker thread ID
 			 *
@@ -217,22 +97,159 @@ namespace Core
 				return( ( this->mThread ).get_id() );
 			}
 
-		private:
-
 			/**
-			 * @brief Worker task runner
+			 * @brief Worker is ready
 			 *
-			 * This method is the hearth of the worker. Internally it is an infinite loop able to be terminated
-			 * by appropriate worker state (State::TERMINATED). Until not terminated, it continuously
-			 * checks the task queue for tasks to be executed. If there are any, it fetches the task out of the queue
-			 * and executes it.
-			 * Once there are no tasks waiting in the queue, it goes into idle mode and waits there until new tasks
-			 * are available or the worker is terminated.
+			 * If the worker is either in IDLE or RUNNING state, it is considered active
 			 */
+			bool isActive( void ) const
+			{
+				return( ( ( this->mState )->isIdle() )
+					 || ( ( this->mState )->isRunning() ) );
+			}
+
+			bool isTerminating( void ) const { return( ( this->mState )->isTerminating() ); }
+
+			bool isShutDown( void ) const { return( ( this->mState )->isShutdown() ); }
+
+			/* 'External' commands */
+
+			void run( void ) { ( this->mState )->run( this ); }
+
+			void wait( void ) { ( this->mState )->wait( this );	}
+
+			void terminate( void ) { ( this->mState )->terminate( this ); }
+
+		private:
+			/* TODO: Make it private to prevent access from outside? */
+			void idle( void ) { ( this->mState )->idle( this ); }
+
+			void shutdown( void ) { ( this->mState )->shutdown( this ); }
+
+			class State
+			{
+			public:
+				virtual ~State( void ) = default;
+
+				/* TODO: Replace with smart pointers */
+				virtual void idle( Worker * worker ) {}
+				virtual void wait( Worker * worker ) {}
+				virtual void run( Worker * worker ) {}
+				virtual void terminate( Worker * worker ) {}
+				virtual void shutdown( Worker * worker ) {}
+
+				virtual bool isIdle( void ) { return( false ); }
+				virtual bool isWaiting( void ) { return( false ); }
+				virtual bool isRunning( void ) { return( false ); }
+				virtual bool isTerminating( void ) { return( false ); }
+				virtual bool isShutdown( void ) { return( false ); }
+			};
+
+			class Idle : public State
+			{
+			public:
+				bool isIdle( void ) override final { return( true ); }
+
+				/* TODO: Replace with smart pointer */
+				void run( Worker * worker ) override final
+				{
+#if DEBUG_CONSOLE_OUTPUT
+					std::cout << "[Worker " << worker->getID() << "] IDLE -> RUNNING" << std::endl;
+#endif
+					/* Transit the state to Running */
+					worker->mState = new Running();
+				}
+
+				/* TODO: Replace with smart pointer */
+				void terminate( Worker * worker ) override final
+				{
+#if DEBUG_CONSOLE_OUTPUT
+					std::cout << "[Worker " << worker->getID() << "] IDLE -> TERMINATING" << std::endl;
+#endif
+					/* Transit the state to Terminating */
+					worker->mState = new Terminating();
+				}
+			};
+
+			class Running : public State
+			{
+			public:
+				bool isRunning( void ) override final { return( true ); }
+
+				/* TODO: Replace with smart pointer */
+				void wait( Worker * worker ) override final
+				{
+#if DEBUG_CONSOLE_OUTPUT
+					std::cout << "[Worker " << worker->getID() << "] RUNNING -> WAITING" << std::endl;
+#endif
+					/* Transit the state to Waiting */
+					worker->mState = new Waiting();
+				}
+
+				/* TODO: Replace with smart pointer */
+				void idle( Worker * worker ) override final
+				{
+#if DEBUG_CONSOLE_OUTPUT
+					std::cout << "[Worker " << worker->getID() << "] RUNNING -> IDLE" << std::endl;
+#endif
+					/* Transit the state to Idle */
+					worker->mState = new Idle();
+				}
+
+				/* TODO: What if the termination is requested during the task execution? */
+				/* TODO: Replace with smart pointer */
+				void terminate( Worker * worker ) override final
+				{
+#if DEBUG_CONSOLE_OUTPUT
+					std::cout << "[Worker " << worker->getID() << "] RUNNING -> TERMINATING" << std::endl;
+#endif
+					/* Transit the state to Terminating */
+					worker->mState = new Terminating();
+				}
+			};
+
+			class Waiting : public State
+			{
+			public:
+				bool isWaiting( void ) override final { return( true ); }
+
+				/* TODO: Replace with smart pointer */
+				void run( Worker * worker ) override final
+				{
+#if DEBUG_CONSOLE_OUTPUT
+					std::cout << "[Worker " << worker->getID() << "] WAITING -> RUNNING" << std::endl;
+#endif
+					/* Transit the state to Running */
+					worker->mState = new Running();
+				}
+			};
+
+			class Terminating : public State
+			{
+			public:
+				bool isTerminating( void ) override final { return( true ); }
+
+				/* TODO: Replace with smart pointer */
+				void shutdown( Worker * worker ) override final
+				{
+#if DEBUG_CONSOLE_OUTPUT
+					std::cout << "[Worker " << worker->getID() << "] TERMINATING -> SHUTDOWN" << std::endl;
+#endif
+					/* Transit the state to Waiting */
+					worker->mState = new Shutdown();
+				}
+			};
+
+			class Shutdown : public State
+			{
+			public:
+				bool isShutdown( void ) override final { return( true ); }
+			};
+
 			void taskRunner( ThreadPool * threadPool )
 			{
-				/* Infinite loop */
-				while( this->getState() != State::TERMINATING )
+				/* Remain within infinite loop till terminated */
+				while( !( this->mState )->isTerminating() )
 				{
 					/* Lock the task queue to get thread safe access */
 					std::unique_lock<std::mutex> taskQueueLock( threadPool->mTaskQueueMutex );
@@ -241,7 +258,8 @@ namespace Core
 					 * and wait there till some tasks are available or the worker is terminated */
 					if( threadPool->getNumOfTasksWaiting() == 0 )
 					{
-						this->setState( State::IDLE );
+						/* Go to idle state */
+						this->idle();
 
 						/* Wait for tasks to be available in the queue.
 						 *
@@ -254,7 +272,7 @@ namespace Core
 						threadPool->mTasksAvailable.wait( taskQueueLock, [&]()
 						{
 							/* Predicate which returns ​false if the waiting should be continued */
-							return( this->getState() == State::TERMINATING );
+							return( ( this->mState )->isTerminating() );
 
 						} );
 
@@ -269,7 +287,7 @@ namespace Core
 					else
 					{
 						/* It is about to execute the task so the worker is running again */
-						this->setState( State::RUNNING );
+						this->run();
 
 						/* Fetch the task from task queue */
 						TTask task = ( threadPool->mTaskQueue ).front();
@@ -288,19 +306,20 @@ namespace Core
 						task();
 
 						/* Once the task is finished, switch the worker to IDLE state */
-						this->setState( State::IDLE );
+						this->idle();
 					}
 				}
 
-				/* The worker is shut down */
-				this->setState( State::SHUTDOWN );
+				/* Go to shutdown state */
+				this->shutdown();
 			}
 
-			State		mState;
+		private:
+
+			/* TODO: Replace with smart pointer */
+			State * 	mState;
 
 			std::thread	mThread;
-
-			bool 		mTerminated = false;
 		};
 
 #if THREADPOOL_IS_SINGLETON
