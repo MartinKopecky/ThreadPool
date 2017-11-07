@@ -57,8 +57,22 @@ namespace Core
 
 		class Worker
 		{
+		private:
+
+			/**
+			 * @brief Worker default constructor
+			 *
+			 * Default constructor is not applicable as the ThreadPool reference is mandatory
+			 */
+			Worker( void ) = delete;
+
 		public:
 
+			/**
+			 * @brief Worker constructor
+			 *
+			 * ThreadPool reference is mandatory for Worker to operate
+			 */
 			Worker( ThreadPool * threadPool )
 				:	/* Initially the worker state is idle */
 					mState( new Idle )
@@ -68,6 +82,20 @@ namespace Core
 			}
 
 			/**
+			 * @brief Worker copy constructor [DELETED]
+			 *
+			 * Worker is not copyable as the thread inside must be unique
+			 */
+			Worker( const Worker & ) = delete;
+
+			/**
+			 * @brief Worker move constructor [DEFAULT]
+			 *
+			 * Worker shall be moveable
+			 */
+			Worker( Worker && ) = default;
+
+			/**
 			 * @brief Thread pool worker destructor
 			 *
 			 * The destructor's goal is to request worker termination, wait for the worker to finish
@@ -75,16 +103,8 @@ namespace Core
 			 */
 			~Worker( void )
 			{
-				this->terminate();
-
-				std::thread::id ID = this->getID();
-
 				/* Wait for the thread to finish */
 				if( ( this->mThread ).joinable() ) ( this->mThread ).join();
-
-				std::cout << "[Worker " << ID << "] Thread joined. Worker is destructed." << std::endl;
-
-				return;
 			}
 
 			/**
@@ -121,7 +141,7 @@ namespace Core
 			void terminate( void ) { ( this->mState )->terminate( this ); }
 
 		private:
-			/* TODO: Make it private to prevent access from outside? */
+		
 			void idle( void ) { ( this->mState )->idle( this ); }
 
 			void shutdown( void ) { ( this->mState )->shutdown( this ); }
@@ -131,7 +151,6 @@ namespace Core
 			public:
 				virtual ~State( void ) = default;
 
-				/* TODO: Replace with smart pointers */
 				virtual void idle( Worker * worker ) {}
 				virtual void wait( Worker * worker ) {}
 				virtual void run( Worker * worker ) {}
@@ -150,7 +169,6 @@ namespace Core
 			public:
 				bool isIdle( void ) override final { return( true ); }
 
-				/* TODO: Replace with smart pointer */
 				void run( Worker * worker ) override final
 				{
 #if DEBUG_CONSOLE_OUTPUT
@@ -160,7 +178,6 @@ namespace Core
 					worker->mState = new Running();
 				}
 
-				/* TODO: Replace with smart pointer */
 				void terminate( Worker * worker ) override final
 				{
 #if DEBUG_CONSOLE_OUTPUT
@@ -176,7 +193,6 @@ namespace Core
 			public:
 				bool isRunning( void ) override final { return( true ); }
 
-				/* TODO: Replace with smart pointer */
 				void wait( Worker * worker ) override final
 				{
 #if DEBUG_CONSOLE_OUTPUT
@@ -186,7 +202,6 @@ namespace Core
 					worker->mState = new Waiting();
 				}
 
-				/* TODO: Replace with smart pointer */
 				void idle( Worker * worker ) override final
 				{
 #if DEBUG_CONSOLE_OUTPUT
@@ -196,8 +211,6 @@ namespace Core
 					worker->mState = new Idle();
 				}
 
-				/* TODO: What if the termination is requested during the task execution? */
-				/* TODO: Replace with smart pointer */
 				void terminate( Worker * worker ) override final
 				{
 #if DEBUG_CONSOLE_OUTPUT
@@ -213,7 +226,6 @@ namespace Core
 			public:
 				bool isWaiting( void ) override final { return( true ); }
 
-				/* TODO: Replace with smart pointer */
 				void run( Worker * worker ) override final
 				{
 #if DEBUG_CONSOLE_OUTPUT
@@ -229,7 +241,6 @@ namespace Core
 			public:
 				bool isTerminating( void ) override final { return( true ); }
 
-				/* TODO: Replace with smart pointer */
 				void shutdown( Worker * worker ) override final
 				{
 #if DEBUG_CONSOLE_OUTPUT
@@ -269,7 +280,7 @@ namespace Core
 						 * OR
 						 * the worker should be terminated.
 						 */
-						threadPool->mTasksAvailable.wait( taskQueueLock, [&]()
+						threadPool->mWorkerWakeUp.wait( taskQueueLock, [&]()
 						{
 							/* Predicate which returns ​false if the waiting should be continued */
 							return( ( this->mState )->isTerminating() );
@@ -312,11 +323,13 @@ namespace Core
 
 				/* Go to shutdown state */
 				this->shutdown();
+
+				/* Wake up trimming thread */
+				( threadPool->mTrimmerWakeUp ).notify_all();
 			}
 
 		private:
 
-			/* TODO: Replace with smart pointer */
 			State * 	mState;
 
 			std::thread	mThread;
@@ -333,9 +346,8 @@ namespace Core
 		 * This constructor must be made protected in case of ThreadPool being a singleton.
 		 */
 		ThreadPool( void )
-			:	mSize( std::thread::hardware_concurrency() - 1 ),
-				/* TODO */
-				mShutdown( false )
+			:	/* Estimate number of threads based on the HW available */
+				mSize( std::thread::hardware_concurrency() - 1 )
 		{
 			/* Run the task runner in new thread */
 			this->mTrimmingThread = std::thread( std::bind( & ThreadPool::trim, this, this ) );
@@ -343,35 +355,26 @@ namespace Core
 
 		~ThreadPool( void )
 		{
-			std::cout << "Going to terminate all workers..." << std::endl;
-
 			/* First of all, terminate all workers */
-			for( auto & worker : this->mWorkers )
+			for( Core::ThreadPool::Worker & worker : this->mWorkers )
 			{
-				worker->terminate();
+				worker.terminate();
 			}
 
 			/* Notify all workers that it's time to recover from possible IDLE state
 			 * and to do the termination */
-			this->mTasksAvailable.notify_all();
+			this->mWorkerWakeUp.notify_all();
 
 			/* No (zero) workers are needed. */
 			this->mSize = 0;
 
 			/* Do the trimming */
-			this->mPerformTrimming.notify_one();
-
-			std::cout << "Going to join trimming thread." << std::endl;
-
-			this->mShutdown = true;
-			this->mPerformTrimming.notify_one();
+			this->mTrimmerWakeUp.notify_one();
 
 			/* Join trimming thread */
 			( this->mTrimmingThread ).join();
 
-			std::cout << "Joined." << std::endl;
-
-			std::cout << "ThreadPool destructor done." << std::endl;
+			std::cout << "ThreadPool shut down." << std::endl;
 		}
 
 	public:
@@ -411,7 +414,7 @@ namespace Core
 			taskQueueLock.unlock();
 
 			/* Let waiting workers know there is an available job */
-			this->mTasksAvailable.notify_one();
+			this->mWorkerWakeUp.notify_one();
 
 			return returnFuture;
 		}
@@ -429,12 +432,8 @@ namespace Core
 			/* Lock the workers container to get thread safe access */
 			std::unique_lock<std::mutex> workersListLock( this->mWorkersMutex );
 
-			/* Check wheter there is matching worker and is still valid */
-			if( !( this->getWorker() ).expired() )
-			{
-				/* Call worker wait() method */
-				( ( this->getWorker() ).lock() )->wait();
-			}
+			/* Call worker wait() method */
+			( this->getWorker() ).wait();
 
 			/* Unlock the workers container */
 			workersListLock.unlock();
@@ -451,12 +450,8 @@ namespace Core
 			/* Lock the workers container to get thread safe access */
 			std::unique_lock<std::mutex> workersListLock( this->mWorkersMutex );
 
-			/* Check wheter there is matching worker and is still valid */
-			if( !( this->getWorker() ).expired() )
-			{
-				/* Call worker run() method */
-				( ( this->getWorker() ).lock() )->run();
-			}
+			/* Call worker run() method */
+			( this->getWorker() ).run();
 
 			/* Unlock the workers container */
 			workersListLock.unlock();
@@ -470,26 +465,26 @@ namespace Core
 		 * This method gets the current thread ID and searches for a worker in which scope
 		 * the method has been executed.
 		 */
-		std::weak_ptr<Worker> getWorker( void ) const
+		Core::ThreadPool::Worker & getWorker( void )
 		{
 			/* Get current thread ID => identify the thread in which the notifyWaiting
 			 * method was executed */
 			std::thread::id currentThreadID = std::this_thread::get_id();
 
 			/* Iterate through all the workers currently existing */
-			for( std::shared_ptr<Worker> worker : this->mWorkers  )
+			for( Core::ThreadPool::Worker & worker : this->mWorkers  )
 			{
 				/* If the thread ID of worker being examined matches current thread,
 				 * notify the worker about task being in waiting mode */
-				if( worker->getID() == currentThreadID )
+				if( worker.getID() == currentThreadID )
 				{
 					return( worker );
 				}
 			}
 
-			/* If no matching worker is found, return empty pointer. This will be recognized
-			 * by weak_ptr's expire() method */
-			return( std::weak_ptr<Worker>() );
+			/* Once the execution reaches this section, no matching worker has been found.
+			 * This is considered as runtime error */
+			throw std::runtime_error( "No worker found." );
 		}
 
 		/**
@@ -499,20 +494,26 @@ namespace Core
 		 */
 		using TTask = std::function<void( void )>;
 
+		struct WorkerRemovalPredicate
+		{
+			bool operator() ( const Worker & worker ) const
+			{
+				return( worker.isShutDown() );
+			}
+		};
+
 		void trim( ThreadPool * threadPool )
 		{
-			std::cout << "Starting trimming thread" << std::endl;
-
-			while( !( this->mShutdown ) )
+			while( true )
 			{
 				/* Lock the task queue to get thread safe access */
 				std::unique_lock<std::mutex> workersListLock( threadPool->mWorkersMutex );
 
 				unsigned int nActiveWorkers = 0;
 
-				for( const auto & worker : this->mWorkers )
+				for( const Core::ThreadPool::Worker & worker : this->mWorkers )
 				{
-					if( worker->isActive() ) nActiveWorkers++;
+					if( worker.isActive() ) nActiveWorkers++;
 				}
 
 				/* There are less active workers than recommended -> add some */
@@ -520,29 +521,28 @@ namespace Core
 				{
 					for( unsigned int i = 0; i < ( threadPool->mSize - nActiveWorkers ); i++ )
 					{
-						( this->mWorkers ).emplace( ( this->mWorkers ).end(), std::make_shared<Worker>( this ) );
+						( this->mWorkers ).emplace( ( this->mWorkers ).end(), this );
 					}
 				}
 
-				/* Remove all terminated workers */
-				for( const auto & worker : this->mWorkers )
+				/* TODO: Implement the algorithm to remove an amount of workers which are first
+				 * going to IDLE to trim to appropriate pool size asap */
+#if false
+				if( nActiveWorkers > threadPool->mSize )
 				{
-					/* If worker is currently shutting down itself */
-					if( worker->isTerminating() )
-					{
-						/* Block the thread till the worker is really shut down */
-						while( !worker->isShutDown() );
 
-						std::cout << "Trim removes worker... " << worker << std::endl;
-						/* Remove the worker completely */
-						( this->mWorkers ).remove( worker );
+				}
+#endif
 
-						std::cout << "Done." << worker << std::endl;
-					}
+				( this->mWorkers ).remove_if( WorkerRemovalPredicate() );
+
+				if( ( this->mWorkers ).empty() )
+				{
+					break;
 				}
 
 				/* Wait here till the condition variable is notified */
-				threadPool->mPerformTrimming.wait( workersListLock );
+				threadPool->mTrimmerWakeUp.wait( workersListLock );
 
 				workersListLock.unlock();
 			}
@@ -554,10 +554,9 @@ namespace Core
 		 * Inspiration: https://stackoverflow.com/a/21900725/5677080 */
 		mutable std::mutex			mTaskQueueMutex;
 
+		/* TODO: The type of queue might be changed to std::priority_queue. The tasks can then be a pack of
+		 * the task itself and it's priority */
 		std::queue<TTask>			mTaskQueue;
-
-		/* TODO: Rename the condition variable as the name does not reflect the real usage */
-		std::condition_variable		mTasksAvailable;
 
 		/**
 		 * @brief Workers
@@ -566,19 +565,19 @@ namespace Core
 		 * std::list is a container that supports constant time insertion and removal of elements
 		 * from anywhere in the container. This feature is used in adding/removal of new workers.
 		 */
-		using TWorkersContainer = std::list<std::shared_ptr<Worker>>;
-
 		mutable std::mutex			mWorkersMutex;
 
-		TWorkersContainer			mWorkers;
+		std::list<Worker>			mWorkers;
+
+		std::condition_variable		mWorkerWakeUp;
 
 		std::thread					mTrimmingThread;
 
-		std::condition_variable		mPerformTrimming;
+		std::condition_variable		mTrimmerWakeUp;
 
+		/* TODO: The size parameter is now calculated during ThreadPool constuction. It might be valuable
+		 * option to make it configurable somehow */
 		std::atomic<unsigned int> 	mSize;
-
-		std::atomic<bool>			mShutdown;
 	};
 }
 #endif /* THREADPOOL_THREADPOOL_H_ */
