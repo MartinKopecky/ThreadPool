@@ -222,6 +222,20 @@ namespace Core
 				stateLock.unlock();
 			}
 
+			bool terminate_if( bool request )
+			{
+				if( request )
+				{
+					this->terminate();
+
+					return( true );
+				}
+				else
+				{
+					return( false );
+				}
+			}
+
 		private:
 		
 			/**
@@ -338,8 +352,8 @@ namespace Core
 					/* Transit the state to Blocked */
 					worker->mState = new Blocked();
 
-					/* Wake up trimming thread */
-					( worker->mThreadPool->mTrimmerWakeUp ).notify_all();
+					/* Notify trimmer it's time to work */
+					worker->mThreadPool->mTrimmer->notify();
 				}
 
 				void idle( Worker * worker ) override final
@@ -372,8 +386,8 @@ namespace Core
 					/* Transit the state to Running */
 					worker->mState = new Running();
 
-					/* Wake up trimming thread */
-					( worker->mThreadPool->mTrimmerWakeUp ).notify_all();
+					/* Notify trimmer it's time to work */
+					worker->mThreadPool->mTrimmer->notify();
 				}
 			};
 
@@ -400,18 +414,12 @@ namespace Core
 				{
 					/* First of all check whether some workers should be removed. If so, this worker
 					 * is the first among others which detects that so it should terminate itself. */
-					if( this->mThreadPool->mWorkersToRemove > 0 )
+					if( this->terminate_if( this->mThreadPool->mTrimmer->shouldTerminate() ) )
 					{
-						std::cout << "Worker " << this->getID() << " is going to remove itself as the pool is oversubscribed: " << this->mThreadPool->mWorkersToRemove << std::endl;
-
-						/* As this worker is to be terminated, the overall amount must be lowered by one */
-						this->mThreadPool->mWorkersToRemove--;
-
-						/* Terminate itself */
-						this->terminate();
-
-						/* Break this loop iteration */
-						break;
+#if DEBUG_CONSOLE_OUTPUT
+						std::cout << "Worker " << this->getID() << " is going to remove itself as the pool is oversubscribed." << std::endl;
+#endif
+						this->mThreadPool->mTrimmer->confirmTermination();
 					}
 
 					/* Lock the task queue to get thread safe access */
@@ -475,8 +483,8 @@ namespace Core
 				/* Go to shutdown state */
 				this->shutdown();
 
-				/* Wake up trimming thread */
-				( this->mThreadPool->mTrimmerWakeUp ).notify_all();
+				/* Notify trimmer it should do it's job */
+				this->mThreadPool->mTrimmer->notify();
 			}
 
 		private:
@@ -490,28 +498,188 @@ namespace Core
 			std::thread			mThread;
 		};
 
+		class ITrimStrategy
+		{
+		public:
+
+			ITrimStrategy( ThreadPool * threadPool )
+				:	/* Estimate number of threads based on the HW available */
+					mThreadPoolSize( std::thread::hardware_concurrency() - 1 ),
+					/* Amount of workers to be removed is initially zero. The value is calculated by trimming thread */
+					mWorkersToRemove( 0U )
+			{
+#if DEBUG_CONSOLE_OUTPUT
+				std::cout << "Constructing trimming strategy. Starting the thread..." << std::endl;
+#endif
+				/* Run the task runner in new thread */
+				this->mTrimmingThread = std::thread( std::bind( & ITrimStrategy::trim, this, threadPool ) );
+			}
+
+			virtual ~ITrimStrategy( void )
+			{
+				/* Join trimming thread */
+				( this->mTrimmingThread ).join();
+#if DEBUG_CONSOLE_OUTPUT
+				std::cout << "Trimming strategy destructed." << std::endl;
+#endif
+			}
+
+			void setTrimTarget( unsigned int nWorkers )
+			{
+				this->mThreadPoolSize = nWorkers;
+			}
+
+			void notify( void )
+			{
+				/* Do the trimming */
+				this->mTrimmerWakeUp.notify_one();
+			}
+
+			bool shouldTerminate( void ) const
+			{
+				return( this->mWorkersToRemove > 0U );
+			}
+
+			void confirmTermination( void )
+			{
+				if( this->mWorkersToRemove > 0U )
+					this->mWorkersToRemove--;
+			}
+
+		protected:
+			struct WorkerRemovalPredicate
+			{
+				bool operator() ( const Worker & worker ) const
+				{
+					return( worker.isShutDown() );
+				}
+			};
+
+			virtual void trim( ThreadPool * threadPool ) = 0;
+
+			std::thread					mTrimmingThread;
+
+			std::condition_variable		mTrimmerWakeUp;
+
+			/* TODO: The size parameter is now calculated during ThreadPool constuction. It might be valuable
+			 * option to make it configurable somehow */
+			std::atomic<unsigned int> 	mThreadPoolSize;
+
+			std::atomic<unsigned int>	mWorkersToRemove;
+		};
+
+		class TrimOneAliveWorker
+			:	public ITrimStrategy
+		{
+		public:
+			TrimOneAliveWorker( ThreadPool * threadPool ) : ITrimStrategy( threadPool ) {}
+
+		private:
+			void trim( ThreadPool * threadPool ) override final
+			{
+#if DEBUG_CONSOLE_OUTPUT
+				std::cout << "Starting 'One alive worker' trimming strategy" << std::endl;
+#endif
+			}
+		};
+
+		class TrimNAliveWorkers
+			:	public ITrimStrategy
+		{
+		public:
+			TrimNAliveWorkers( ThreadPool * threadPool ) : ITrimStrategy( threadPool ) {}
+
+			void trim( ThreadPool * threadPool ) override final
+			{
+#if DEBUG_CONSOLE_OUTPUT
+				std::cout << "Starting 'N alive workers' trimming strategy" << std::endl;
+#endif
+				while( true )
+				{
+					/* Lock the task queue to get thread safe access */
+					std::unique_lock<std::mutex> workersListLock( threadPool->mWorkersMutex );
+
+					unsigned int nActiveWorkers = 0U;
+
+					for( const Core::ThreadPool::Worker & worker : threadPool->mWorkers )
+					{
+						if( worker.isActive() ) nActiveWorkers++;
+					}
+
+					/* There are less active workers than recommended -> add some */
+					/* TODO: Is that a good approach to add more than one worker in single trimming iteration?
+					 * Maybe just to add one worker per trimming iteration... */
+					if( nActiveWorkers < this->mThreadPoolSize )
+					{
+						for( unsigned int i = 0; i < ( this->mThreadPoolSize - nActiveWorkers ); i++ )
+						{
+							/* Construct in-place new worker at the end of the list */
+							( threadPool->mWorkers ).emplace( ( threadPool->mWorkers ).end(), threadPool );
+#if DEBUG_CONSOLE_OUTPUT
+							std::cout << "New Worker added." << std::endl;
+#endif
+						}
+					}
+
+					/* TODO: General approach is to keep mThreadPoolSize number of active workers while the others are blocked.
+					 * Maybe it would be better strategy always keep one worker active, not quite many if the thread pool size is high.
+					 * Both strategies might be available as option... */
+
+					/* If there are more active workers than defined calculate the amount of workers to be terminated. */
+					this->mWorkersToRemove = ( nActiveWorkers > this->mThreadPoolSize ) ? ( nActiveWorkers - this->mThreadPoolSize ) : 0U;
+
+					if( this->mWorkersToRemove > 0 )
+					{
+						/* Notify some worker which is waiting in idle state to possibly remove itself */
+						threadPool->mWorkerWakeUp.notify_one();
+					}
+
+					/* TODO: remove */
+#if DEBUG_CONSOLE_OUTPUT
+					std::cout << "Active workers = " << nActiveWorkers << ", Workers to remove = " << this->mWorkersToRemove << std::endl;
+#endif
+					/* Remove all the workers which match the worker removal predicate (are in ShutDown state) */
+					( threadPool->mWorkers ).remove_if( WorkerRemovalPredicate() );
+
+					if( !( threadPool->mWorkers ).empty() )
+					{
+						/* Wait here till the condition variable is notified */
+						this->mTrimmerWakeUp.wait( workersListLock );
+
+						/* Unlock workers list */
+						workersListLock.unlock();
+					}
+					else
+					{
+						/* Unlock workers list */
+						workersListLock.unlock();
+
+						/* Break trimming loop */
+						break;
+					}
+				}
+			}
+		};
+
 #if THREADPOOL_IS_SINGLETON
 	protected:
 #else
 	public:
 #endif
+
 		/**
 		 * @brief ThreadPool constructor
 		 *
 		 * This constructor must be made protected in case of ThreadPool being a singleton.
 		 */
 		ThreadPool( void )
-			:	/* Estimate number of threads based on the HW available */
-				mThreadPoolSize( std::thread::hardware_concurrency() - 1 ),
-				/* Amount of workers to be removed is initially zero. The value is calculated by trimming thread */
-				mWorkersToRemove( 0 )
-		{
-			/* Run the task runner in new thread */
-			this->mTrimmingThread = std::thread( std::bind( & ThreadPool::trim, this ) );
-		}
+			:	/* TODO: Change this hard coded strategy. Replace by static factory method? */
+				mTrimmer( std::make_unique<TrimNAliveWorkers>( this ) )
+		{}
 
 		~ThreadPool( void )
 		{
+			/* TODO: This might not be needed any longer as this should be in scope of trimming strategy */
 			/* First of all, terminate all workers */
 			for( Core::ThreadPool::Worker & worker : this->mWorkers )
 			{
@@ -522,16 +690,15 @@ namespace Core
 			 * and to do the termination */
 			this->mWorkerWakeUp.notify_all();
 
-			/* No (zero) workers are needed. */
-			this->mThreadPoolSize = 0;
+			/* Set the trimming target to have no workers any more */
+			this->mTrimmer->setTrimTarget( 0U );
 
-			/* Do the trimming */
-			this->mTrimmerWakeUp.notify_one();
+			/* Perform trimming action */
+			this->mTrimmer->notify();
 
-			/* Join trimming thread */
-			( this->mTrimmingThread ).join();
-
+#if DEBUG_CONSOLE_OUTPUT
 			std::cout << "ThreadPool shut down." << std::endl;
+#endif
 		}
 
 	public:
@@ -651,87 +818,13 @@ namespace Core
 		 */
 		using TTask = std::function<void( void )>;
 
-		struct WorkerRemovalPredicate
-		{
-			bool operator() ( const Worker & worker ) const
-			{
-				return( worker.isShutDown() );
-			}
-		};
-
-		void trim( void )
-		{
-			while( true )
-			{
-				/* Lock the task queue to get thread safe access */
-				std::unique_lock<std::mutex> workersListLock( this->mWorkersMutex );
-
-				unsigned int nActiveWorkers = 0U;
-
-				for( const Core::ThreadPool::Worker & worker : this->mWorkers )
-				{
-					if( worker.isActive() ) nActiveWorkers++;
-				}
-
-				/* There are less active workers than recommended -> add some */
-				/* TODO: Is that a good approach to add more than one worker in single trimming iteration?
-				 * Maybe just to add one worker per trimming iteration... */
-				if( nActiveWorkers < this->mThreadPoolSize )
-				{
-					for( unsigned int i = 0; i < ( this->mThreadPoolSize - nActiveWorkers ); i++ )
-					{
-						/* Construct in-place new worker at the end of the list */
-						( this->mWorkers ).emplace( ( this->mWorkers ).end(), this );
-
-						std::cout << "New Worker added." << std::endl;
-					}
-				}
-
-				/* TODO: General approach is to keep mThreadPoolSize number of active workers while the others are blocked.
-				 * Maybe it would be better strategy always keep one worker active, not quite many if the thread pool size is high.
-				 * Both strategies might be available as option... */
-
-				/* If there are more active workers than defined calculate the amount of workers to be terminated. */
-				this->mWorkersToRemove = ( nActiveWorkers > this->mThreadPoolSize ) ? ( nActiveWorkers - this->mThreadPoolSize ) : 0U;
-
-				if( this->mWorkersToRemove > 0 )
-				{
-					/* Notify some worker which is waiting in idle state to possibly remove itself */
-					this->mWorkerWakeUp.notify_one();
-				}
-
-				/* TODO: remove */
-				std::cout << "Active workers = " << nActiveWorkers << ", Workers to remove = " << this->mWorkersToRemove << std::endl;
-
-				/* Remove all the workers which match the worker removal predicate (are in ShutDown state) */
-				( this->mWorkers ).remove_if( WorkerRemovalPredicate() );
-
-				if( !( this->mWorkers ).empty() )
-				{
-					/* Wait here till the condition variable is notified */
-					this->mTrimmerWakeUp.wait( workersListLock );
-
-					/* Unlock workers list */
-					workersListLock.unlock();
-				}
-				else
-				{
-					/* Unlock workers list */
-					workersListLock.unlock();
-
-					/* Break trimming loop */
-					break;
-				}
-			}
-		}
-
 	private:
 
-		mutable std::mutex			mTaskQueueMutex;
+		mutable std::mutex				mTaskQueueMutex;
 
 		/* TODO: The type of queue might be changed to std::priority_queue. The tasks can then be a pack of
 		 * the task itself and it's priority */
-		std::queue<TTask>			mTaskQueue;
+		std::queue<TTask>				mTaskQueue;
 
 		/**
 		 * @brief Workers
@@ -740,21 +833,13 @@ namespace Core
 		 * std::list is a container that supports constant time insertion and removal of elements
 		 * from anywhere in the container. This feature is used in adding/removal of new workers.
 		 */
-		mutable std::mutex			mWorkersMutex;
+		mutable std::mutex				mWorkersMutex;
 
-		std::list<Worker>			mWorkers;
+		std::list<Worker>				mWorkers;
 
-		std::condition_variable		mWorkerWakeUp;
+		std::condition_variable			mWorkerWakeUp;
 
-		std::thread					mTrimmingThread;
-
-		std::condition_variable		mTrimmerWakeUp;
-
-		/* TODO: The size parameter is now calculated during ThreadPool constuction. It might be valuable
-		 * option to make it configurable somehow */
-		std::atomic<unsigned int> 	mThreadPoolSize;
-
-		std::atomic<unsigned int>	mWorkersToRemove;
+		std::unique_ptr<ITrimStrategy>	mTrimmer;
 	};
 }
 #endif /* THREADPOOL_THREADPOOL_H_ */
