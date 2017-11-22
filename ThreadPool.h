@@ -120,6 +120,12 @@ namespace Core
 				return( ( this->mThread ).get_id() );
 			}
 
+			/**
+			 * @brief Worker state evaluation
+			 *
+			 * @returns true	{Worker is currently in STATE given as template parameter}
+			 * @returns false	{Worker state is different to STATE}
+			 */
 			template<typename STATE>
 			bool inState( void ) const
 			{
@@ -146,11 +152,21 @@ namespace Core
 				return( ( this->inState<Idle>() ) || ( this->inState<Running>() ) );
 			}
 
+			/**
+			 * @brief Worker is terminating
+			 *
+			 * Worker is terminating itself so it cannot accept any further tasks.
+			 */
 			bool isTerminating( void ) const
 			{
 				return( this->inState<Terminating>() );
 			}
 
+			/**
+			 * @brief Worker is shut down
+			 *
+			 * Worker termination is finished and the worker is ready to be destroyed.
+			 */
 			bool isShutDown( void ) const
 			{
 				return( this->inState<Shutdown>() );
@@ -158,6 +174,11 @@ namespace Core
 
 			/* 'External' commands */
 
+			/**
+			 * @brief Set Worker to RUNNING state
+			 *
+			 * Thread safe method to set the worker state to RUNNING
+			 */
 			void run( void )
 			{
 				/* Lock the state to get thread safe access */
@@ -169,17 +190,27 @@ namespace Core
 				stateLock.unlock();
 			}
 
-			void wait( void )
+			/**
+			 * @brief Set Worker to BLOCKED state
+			 *
+			 * Thread safe method to set the worker state to BLOCKED
+			 */
+			void blocked( void )
 			{
 				/* Lock the state to get thread safe access */
 				std::unique_lock<std::mutex> stateLock( this->mStateMutex );
 
-				( this->mState )->wait( this );
+				( this->mState )->blocked( this );
 
 				/* Unlock state */
 				stateLock.unlock();
 			}
 
+			/**
+			 * @brief Terminate the worker
+			 *
+			 * Thread safe method to set the worker state to TERMINATING state
+			 */
 			void terminate( void )
 			{
 				/* Lock the state to get thread safe access */
@@ -193,6 +224,11 @@ namespace Core
 
 		private:
 		
+			/**
+			 * @brief Worker idle
+			 *
+			 * Thread safe method to set the worker state to IDLE state
+			 */
 			void idle( void )
 			{
 				/* Lock the state to get thread safe access */
@@ -204,6 +240,11 @@ namespace Core
 				stateLock.unlock();
 			}
 
+			/**
+			 * @brief Worker shutdown
+			 *
+			 * Thread safe method to set the worker state to SHUTDOWN state
+			 */
 			void shutdown( void )
 			{
 				/* Lock the state to get thread safe access */
@@ -215,15 +256,52 @@ namespace Core
 				stateLock.unlock();
 			}
 
+			/**
+			 * @brief State
+			 *
+			 * Generic worker state defining the interface to all concrete states.
+			 * As the state transition methods here are not pure, the concrete state
+			 * can implement just the transitions it needs. All the other state transitions
+			 * would have the default behavior defined in here (do nothing by default)
+			 */
 			class State
 			{
 			public:
 				virtual ~State( void ) = default;
 
+				/**
+				 * @brief Worker idle
+				 *
+				 * Default behavior for transition to IDLE. Should be overridden by concrete state
+				 */
 				virtual void idle( Worker * worker ) {}
-				virtual void wait( Worker * worker ) {}
+
+				/**
+				 * @brief Worker blocked
+				 *
+				 * Default behavior for transition to BLOCKED. Should be overridden by concrete state
+				 */
+				virtual void blocked( Worker * worker ) {}
+
+				/**
+				 * @brief Worker run
+				 *
+				 * Default behavior for transition to RUNNING. Should be overridden by concrete state
+				 */
 				virtual void run( Worker * worker ) {}
+
+				/**
+				 * @brief Worker terminate
+				 *
+				 * Default behavior for transition to TERMINATING. Should be overridden by concrete state
+				 */
 				virtual void terminate( Worker * worker ) {}
+
+				/**
+				 * @brief Worker shut down
+				 *
+				 * Default behavior for transition to SHUTDOWN. Should be overridden by concrete state
+				 */
 				virtual void shutdown( Worker * worker ) {}
 			};
 
@@ -252,13 +330,13 @@ namespace Core
 			class Running : public State
 			{
 			public:
-				void wait( Worker * worker ) override final
+				void blocked( Worker * worker ) override final
 				{
 #if DEBUG_CONSOLE_OUTPUT
-					std::cout << "[Worker " << worker->getID() << "] RUNNING -> WAITING" << std::endl;
+					std::cout << "[Worker " << worker->getID() << "] RUNNING -> BLOCKED" << std::endl;
 #endif
-					/* Transit the state to Waiting */
-					worker->mState = new Waiting();
+					/* Transit the state to Blocked */
+					worker->mState = new Blocked();
 
 					/* Wake up trimming thread */
 					( worker->mThreadPool->mTrimmerWakeUp ).notify_all();
@@ -283,13 +361,13 @@ namespace Core
 				}
 			};
 
-			class Waiting : public State
+			class Blocked : public State
 			{
 			public:
 				void run( Worker * worker ) override final
 				{
 #if DEBUG_CONSOLE_OUTPUT
-					std::cout << "[Worker " << worker->getID() << "] WAITING -> RUNNING" << std::endl;
+					std::cout << "[Worker " << worker->getID() << "] BLOCKED -> RUNNING" << std::endl;
 #endif
 					/* Transit the state to Running */
 					worker->mState = new Running();
@@ -307,14 +385,13 @@ namespace Core
 #if DEBUG_CONSOLE_OUTPUT
 					std::cout << "[Worker " << worker->getID() << "] TERMINATING -> SHUTDOWN" << std::endl;
 #endif
-					/* Transit the state to Waiting */
+					/* Transit the state to Blocked */
 					worker->mState = new Shutdown();
 				}
 			};
 
 			class Shutdown : public State
-			{
-			};
+			{};
 
 			void taskRunner( void )
 			{
@@ -325,6 +402,8 @@ namespace Core
 					 * is the first among others which detects that so it should terminate itself. */
 					if( this->mThreadPool->mWorkersToRemove > 0 )
 					{
+						std::cout << "Worker " << this->getID() << " is going to remove itself as the pool is oversubscribed: " << this->mThreadPool->mWorkersToRemove << std::endl;
+
 						/* As this worker is to be terminated, the overall amount must be lowered by one */
 						this->mThreadPool->mWorkersToRemove--;
 
@@ -384,7 +463,7 @@ namespace Core
 						/* Execute the task.
 						 *
 						 * From within the task, the worker might be notified the task is waiting for some event using
-						 * wait() and run() methods - handled via the ThreadPool instance. So the worker state might be
+						 * blocked() and run() methods - handled via the ThreadPool instance. So the worker state might be
 						 * switched between running and waiting state */
 						task();
 
@@ -458,14 +537,6 @@ namespace Core
 	public:
 
 		/**
-		 * @brief Get the amount of tasks waiting in task queue
-		 */
-		std::size_t getNumOfTasksWaiting( void ) const
-		{
-			return( ( this->mTaskQueue ).size() );
-		}
-
-		/**
 		 * @brief Add function to be executed in the ThreadPool
 		 *
 		 * Add a function to be executed, along with any arguments for it
@@ -498,33 +569,32 @@ namespace Core
 		}
 
 		/**
-		 * @brief Worker wait notification
+		 * @brief Task blocked notification
 		 *
 		 * This method shall be used inside task function to inform the thread pool the task is
 		 * waiting for some event and thus the worker is blocked and not processing the task.
 		 * If all the workers are theoretically in such state it might lead into thread pool deadlock.
 		 * This mechanism is used to prevent that.
 		 */
-		/* TODO: Rename the method to more self-describing name */
-		void wait( void )
+		void notifyBlockedTask( void )
 		{
 			/* Lock the workers container to get thread safe access */
 			std::unique_lock<std::mutex> workersListLock( this->mWorkersMutex );
 
 			/* Call worker wait() method */
-			( this->getWorker() ).wait();
+			( this->getWorker() ).blocked();
 
 			/* Unlock the workers container */
 			workersListLock.unlock();
 		}
 
 		/**
-		 * @brief Worker run notification
+		 * @brief Task running notification
 		 *
 		 * This method shall be used inside task function to inform the thread pool the task is
-		 * running again after some period of time spent in waiting mode.
+		 * running again after some period of time spent in blocked mode.
 		 */
-		void run( void )
+		void notifyRunningTask( void )
 		{
 			/* Lock the workers container to get thread safe access */
 			std::unique_lock<std::mutex> workersListLock( this->mWorkersMutex );
@@ -539,6 +609,14 @@ namespace Core
 	protected:
 
 		/**
+		 * @brief Get the amount of tasks waiting in task queue
+		 */
+		std::size_t getNumOfTasksWaiting( void ) const
+		{
+			return( ( this->mTaskQueue ).size() );
+		}
+
+		/**
 		 * @brief Get current worker being used
 		 *
 		 * This method gets the current thread ID and searches for a worker in which scope
@@ -546,7 +624,7 @@ namespace Core
 		 */
 		Core::ThreadPool::Worker & getWorker( void )
 		{
-			/* Get current thread ID => identify the thread in which the notifyWaiting
+			/* Get current thread ID => identify the thread in which the notifyBlocked
 			 * method was executed */
 			std::thread::id currentThreadID = std::this_thread::get_id();
 
@@ -602,9 +680,10 @@ namespace Core
 				{
 					for( unsigned int i = 0; i < ( this->mThreadPoolSize - nActiveWorkers ); i++ )
 					{
-						std::cout << "Adding worker" << std::endl;
-
+						/* Construct in-place new worker at the end of the list */
 						( this->mWorkers ).emplace( ( this->mWorkers ).end(), this );
+
+						std::cout << "New Worker added." << std::endl;
 					}
 				}
 
@@ -648,8 +727,6 @@ namespace Core
 
 	private:
 
-		/* TODO: Rework a little -> not to operate with the mutex but with std::unique_lock<std::mutex> ?
-		 * Inspiration: https://stackoverflow.com/a/21900725/5677080 */
 		mutable std::mutex			mTaskQueueMutex;
 
 		/* TODO: The type of queue might be changed to std::priority_queue. The tasks can then be a pack of
