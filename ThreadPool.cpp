@@ -333,14 +333,14 @@ namespace Core
 	void ThreadPool::TrimStrategy::DefensiveTrim::trim( ThreadPool * threadPool )
 	{
 #if DEBUG_CONSOLE_OUTPUT
-		std::cout << "Starting 'One alive worker' trimming strategy" << std::endl;
+		std::cout << "Starting DEFENSIVE trimming strategy" << std::endl;
 #endif
 	}
 
 	void ThreadPool::TrimStrategy::AggresiveTrim::trim( ThreadPool * threadPool )
 	{
 #if DEBUG_CONSOLE_OUTPUT
-		std::cout << "Starting 'N alive workers' trimming strategy" << std::endl;
+		std::cout << "Starting AGGRESIVE trimming strategy" << std::endl;
 #endif
 		while( true )
 		{
@@ -412,6 +412,18 @@ namespace Core
 		case Type::AGGRESIVE : return( std::make_unique<AggresiveTrim>( threadPool ) ); break;
 		}
 	}
+
+#if THREADPOOL_IS_SINGLETON
+	ThreadPool & ThreadPool::instance( void )
+	{
+		/* Since it is a static variable, if the class has already been created
+		 * it won't be created again. In C++11 it is thread-safe */
+		static ThreadPool threadPoolInstance;
+
+		/* Return a reference to unique thread pool instance */
+		return( threadPoolInstance );
+	}
+#endif
 
 	ThreadPool::ThreadPool( void )
 		:	/* Create the instance of trimming strategy */

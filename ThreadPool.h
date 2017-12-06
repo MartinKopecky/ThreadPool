@@ -24,12 +24,6 @@
 #include <mutex>
 #include <condition_variable>
 
-/* Boost inclusions */
-#if THREADPOOL_IS_SINGLETON
-/* TODO: Remove the dependency to Boost? Implement singleton inplace of ThreadPool? */
-	#include <boost/serialization/singleton.hpp>
-#endif
-
 /* Shared library support */
 /* TODO: Improve symbol visibility mechanism to give the control to the target application */
 #ifndef THREADPOOL_EXPORT
@@ -49,9 +43,6 @@
 namespace Core
 {
 	class THREADPOOL_EXPORT ThreadPool
-#if THREADPOOL_IS_SINGLETON
-		:	public boost::serialization::singleton<ThreadPool>
-#endif
 	{
 	protected:
 
@@ -189,6 +180,7 @@ namespace Core
 			class State
 			{
 			public:
+
 				virtual ~State( void ) = default;
 
 				/**
@@ -230,6 +222,7 @@ namespace Core
 			class Idle : public State
 			{
 			public:
+
 				void run( Worker * worker ) override final;
 
 				void terminate( Worker * worker ) override final;
@@ -238,6 +231,7 @@ namespace Core
 			class Running : public State
 			{
 			public:
+
 				void blocked( Worker * worker ) override final;
 
 				void idle( Worker * worker ) override final;
@@ -248,12 +242,14 @@ namespace Core
 			class Blocked : public State
 			{
 			public:
+
 				void run( Worker * worker ) override final;
 			};
 
 			class Terminating : public State
 			{
 			public:
+
 				void shutdown( Worker * worker ) override final;
 			};
 
@@ -321,9 +317,11 @@ namespace Core
 				:	public ITrimStrategy
 			{
 			public:
+
 				DefensiveTrim( ThreadPool * threadPool ) : ITrimStrategy( threadPool ) {}
 
 			private:
+
 				void trim( ThreadPool * threadPool ) override final;
 			};
 
@@ -338,6 +336,7 @@ namespace Core
 				:	public ITrimStrategy
 			{
 			public:
+
 				AggresiveTrim( ThreadPool * threadPool ) : ITrimStrategy( threadPool ) {}
 
 			private:
@@ -358,6 +357,41 @@ namespace Core
 		};
 
 #if THREADPOOL_IS_SINGLETON
+	public:
+
+		/**
+		 * @brief ThreadPool instance management
+		 */
+		static ThreadPool & instance( void );
+
+		/**
+		 * @brief ThreadPool copy constructor [DELETED]
+		 *
+		 * ThreadPool is not copyable to respect singleton design pattern
+		 */
+		ThreadPool( ThreadPool const & ) = delete;
+
+		/**
+		 * @brief ThreadPool move constructor [DELETED]
+		 *
+		 * ThreadPool is not movable to respect singleton design pattern
+		 */
+		ThreadPool( ThreadPool && ) = delete;
+
+		/**
+		 * @brief ThreadPool copy assignment operator [DELETED]
+		 *
+		 * ThreadPool is not copy assignable to respect singleton design pattern
+		 */
+		ThreadPool & operator= ( ThreadPool const & ) = delete;
+
+		/**
+		 * @brief ThreadPool move assignment operator [DELETED]
+		 *
+		 * ThreadPool is not move assignable to respect singleton design pattern
+		 */
+		ThreadPool & operator= ( ThreadPool && ) = delete;
+
 	protected:
 #else
 	public:
