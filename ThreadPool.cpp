@@ -330,14 +330,14 @@ namespace Core
 			this->mWorkersToRemove--;
 	}
 
-	void ThreadPool::TrimStrategy::TrimOneAliveWorker::trim( ThreadPool * threadPool )
+	void ThreadPool::TrimStrategy::DefensiveTrim::trim( ThreadPool * threadPool )
 	{
 #if DEBUG_CONSOLE_OUTPUT
 		std::cout << "Starting 'One alive worker' trimming strategy" << std::endl;
 #endif
 	}
 
-	void ThreadPool::TrimStrategy::TrimNAliveWorkers::trim( ThreadPool * threadPool )
+	void ThreadPool::TrimStrategy::AggresiveTrim::trim( ThreadPool * threadPool )
 	{
 #if DEBUG_CONSOLE_OUTPUT
 		std::cout << "Starting 'N alive workers' trimming strategy" << std::endl;
@@ -408,14 +408,14 @@ namespace Core
 		switch( which )
 		{
 		default:
-		case Type::STRATEGY_1 : return( std::make_unique<TrimOneAliveWorker>( threadPool ) ); break;
-		case Type::STRATEGY_2 : return( std::make_unique<TrimNAliveWorkers>( threadPool ) ); break;
+		case Type::DEFENSIVE : return( std::make_unique<DefensiveTrim>( threadPool ) ); break;
+		case Type::AGGRESIVE : return( std::make_unique<AggresiveTrim>( threadPool ) ); break;
 		}
 	}
 
 	ThreadPool::ThreadPool( void )
 		:	/* Create the instance of trimming strategy */
-			mTrimmer( TrimStrategy::create( TrimStrategy::Type::STRATEGY_2, this ) )
+			mTrimmer( TrimStrategy::create( TrimStrategy::Type::AGGRESIVE, this ) )
 	{}
 
 	ThreadPool::~ThreadPool( void )

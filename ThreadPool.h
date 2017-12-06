@@ -310,21 +310,35 @@ namespace Core
 
 		private:
 
-			class TrimOneAliveWorker
+			/**
+			 * @brief Defensive trim strategy
+			 *
+			 * In defensive trim strategy one worker is always kept active. If all existing workers are being blocked,
+			 * one new worker is added. Once any previously blocked worker gets running again, the amount of workers is
+			 * trimmed again to required thread pool size.
+			 */
+			class DefensiveTrim
 				:	public ITrimStrategy
 			{
 			public:
-				TrimOneAliveWorker( ThreadPool * threadPool ) : ITrimStrategy( threadPool ) {}
+				DefensiveTrim( ThreadPool * threadPool ) : ITrimStrategy( threadPool ) {}
 
 			private:
 				void trim( ThreadPool * threadPool ) override final;
 			};
 
-			class TrimNAliveWorkers
+			/**
+			 * @brief Aggresive trim strategy
+			 *
+			 * In aggresive trim strategy defined (thread pool size) amount of workers is always kept active. If all
+			 * existing workers are being blocked, this amount of new workers is added. Once any previously blocked worker
+			 * gets running again, the amount of workers is trimmed again to required amount of active workers.
+			 */
+			class AggresiveTrim
 				:	public ITrimStrategy
 			{
 			public:
-				TrimNAliveWorkers( ThreadPool * threadPool ) : ITrimStrategy( threadPool ) {}
+				AggresiveTrim( ThreadPool * threadPool ) : ITrimStrategy( threadPool ) {}
 
 			private:
 
@@ -335,8 +349,8 @@ namespace Core
 
 			enum class Type : unsigned int
 			{
-				STRATEGY_1,
-				STRATEGY_2
+				DEFENSIVE,
+				AGGRESIVE
 			};
 
 			static std::unique_ptr<ITrimStrategy> create( const Type which, ThreadPool * threadPool );
